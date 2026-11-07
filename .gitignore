@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+pytest-cache-files-*/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+artifacts/
+reports/
+README_AI.md

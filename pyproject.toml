@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-umm"
+version = "0.1.0"
+description = "Structured-token understanding, generation and editing for 28×28 shapes"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch>=2.4", "PyYAML", "Pillow>=9.1", "matplotlib", "tensorboard"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["configs", "data", "models", "training", "evaluation"]
+py-modules = ["inference", "demo"]
+
+[tool.setuptools.package-data]
+configs = ["default.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

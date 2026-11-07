@@ -1,0 +1,300 @@
+seed: 42
+image_size: 28
+counts:
+- 1
+- 2
+- 3
+- 4
+- 5
+colors:
+  names:
+  - red
+  - orange
+  - yellow
+  - green
+  - cyan
+  - blue
+  - purple
+  - pink
+  - brown
+  - white
+  - black
+  rgb:
+  - - 228
+    - 43
+    - 49
+  - - 245
+    - 137
+    - 32
+  - - 246
+    - 222
+    - 57
+  - - 42
+    - 172
+    - 74
+  - - 44
+    - 211
+    - 221
+  - - 49
+    - 89
+    - 230
+  - - 123
+    - 60
+    - 181
+  - - 236
+    - 101
+    - 178
+  - - 133
+    - 86
+    - 52
+  - - 242
+    - 242
+    - 242
+  - - 25
+    - 25
+    - 25
+shapes:
+  names:
+  - square
+  - circle
+  - triangle
+tokens:
+  count_keep: 6
+  count_mask: 7
+  color_mask: 11
+  shape_mask: 3
+paths:
+  data_dir: artifacts/data
+  checkpoint_dir: artifacts/experiments/no_direct/checkpoints
+  output_dir: artifacts/outputs/tensorboard/experiments/no_direct
+data:
+  scene_counts:
+    train: 40000
+    val: 5000
+    test_random: 4000
+    test_comp: 1000
+  shard_size: 10000
+  heldout_combos:
+  - - 1
+    - 0
+    - 0
+  - - 1
+    - 4
+    - 1
+  - - 2
+    - 1
+    - 2
+  - - 2
+    - 6
+    - 0
+  - - 2
+    - 9
+    - 1
+  - - 3
+    - 2
+    - 0
+  - - 3
+    - 5
+    - 1
+  - - 3
+    - 8
+    - 2
+  - - 4
+    - 3
+    - 2
+  - - 4
+    - 7
+    - 1
+  - - 5
+    - 0
+    - 2
+  - - 5
+    - 10
+    - 0
+  render:
+    supersample: 8
+  rotation:
+    enabled: true
+    num_angles: 12
+  layout:
+    arrangement_probs:
+      random: 0.45
+      grid: 0.35
+      edge: 0.2
+    margin: 1.5
+    object_gap: 2.0
+    max_attempts: 64
+    min_object_area: 5
+    min_triangle_area: 5
+    size_ranges:
+      1:
+      - 8
+      - 17
+      2:
+      - 7
+      - 12
+      3:
+      - 6
+      - 10
+      4:
+      - 6
+      - 9
+      5:
+      - 6
+      - 8
+  background:
+    types:
+    - solid
+    - gradient
+    - checker
+    probs:
+    - 0.45
+    - 0.35
+    - 0.2
+    min_fg_bg_distance: 110
+    gradient_factor:
+    - 0.91
+    - 1.05
+    checker_factor: 0.035
+    checker_cell: 3
+  noise:
+    types:
+    - none
+    - gaussian
+    - impulse
+    probs:
+    - 0.5
+    - 0.35
+    - 0.15
+    gaussian_sigma:
+    - 0.008
+    - 0.022
+    impulse_fraction:
+    - 0.002
+    - 0.008
+  edit:
+    types:
+    - color
+    - shape
+    - both
+    probs:
+    - 1
+    - 1
+    - 1
+    bbox_pad: 0
+model:
+  token_dim: 32
+  instruction_dim: 256
+  understanding:
+    hidden:
+    - 512
+    - 512
+    feature_dim: 256
+    dropout: 0.1
+  visual_tokens: 4
+  visual_dim: 256
+  source_width: 32
+  flow:
+    width: 32
+    time_dim: 64
+    condition_dim: 128
+    attention_heads: 4
+  connector:
+    width: 512
+    discrete_width: 640
+training:
+  device: auto
+  amp: true
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  understanding:
+    epochs: 150
+    batch_size: 256
+    lr: 0.001
+    augment: true
+  flow:
+    epochs: 100
+    batch_size: 96
+    lr: 0.0003
+    direct_dropout: 0.5
+    direct_source: false
+  connector:
+    epochs: 60
+    batch_size: 96
+    lr: 0.0005
+    generation_ratio: 0.3
+    freeze_instruction: true
+    direct_source: false
+    reconstruct_epochs: 0
+  adapter:
+    epochs: 15
+    lr: 0.0001
+sampling:
+  steps: 40
+  solver: midpoint
+  generation_instruction_gain: 1.5
+  edit_instruction_gain: 1.0
+evaluation:
+  batch_size: 48
+  max_samples: null
+  diversity_conditions: 24
+  diversity_repeats: 4
+  chain_samples: 32
+  chain_rounds: 3
+  oracle:
+    min_component_area: 4
+    min_template_iou: 0.52
+    localization_pad: 1
+logging:
+  sample_every: 5
+  sample_count: 8
+  sample_steps: 16
+smoke:
+  paths:
+    data_dir: artifacts/smoke/data
+    checkpoint_dir: artifacts/smoke/checkpoints
+    output_dir: artifacts/smoke/outputs
+  data:
+    scene_counts:
+      train: 1200
+      val: 200
+      test_random: 150
+      test_comp: 50
+  model:
+    understanding:
+      hidden:
+      - 192
+      - 192
+      feature_dim: 128
+    instruction_dim: 128
+    visual_dim: 128
+    source_width: 16
+    flow:
+      width: 16
+      condition_dim: 64
+    connector:
+      width: 192
+      discrete_width: 224
+  training:
+    understanding:
+      epochs: 3
+      batch_size: 128
+    flow:
+      epochs: 2
+      batch_size: 64
+    connector:
+      epochs: 2
+      batch_size: 64
+    adapter:
+      epochs: 1
+  sampling:
+    steps: 8
+  evaluation:
+    batch_size: 32
+    diversity_conditions: 4
+    diversity_repeats: 3
+    chain_samples: 6
+  logging:
+    sample_every: 1
+    sample_count: 4
+    sample_steps: 4
