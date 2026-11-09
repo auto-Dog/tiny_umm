@@ -1,9 +1,9 @@
 import numpy as np
 import torch
 
-from data.schema import generate_prompt, load_config
+from data.schema import edit_prompt, generate_prompt, load_config
 from inference import Pipeline
-from models.bottleneck import GaussianBottleneck, latent_mean
+from models.bottleneck import ConditionalVisualBottleneck, GaussianBottleneck, latent_mean
 from models.checkpoints import flow_state, save_checkpoint
 from models.flow import FlowCondition, flow_matching_errors
 from models.tiny_umm import TinyUMM
@@ -53,3 +53,88 @@ def test_generation_gradients_and_posttrained_checkpoint_inference(artifact_dir)
     assert pipeline.model.bottleneck is not None
     images = pipeline.generate(prompts, steps=2, seed=44)
     np.testing.assert_array_equal(images, pipeline.generate(prompts, steps=2, seed=44))
+
+
+@torch.no_grad()
+def test_conditional_bottleneck_keeps_instruction_and_generation_intact(artifact_dir):
+    cfg = load_config(smoke=True)
+    cfg["paths"]["checkpoint_dir"] = str(artifact_dir)
+    model = TinyUMM(cfg, "connector").eval()
+    model.bottleneck = ConditionalVisualBottleneck(cfg, max_std_ratio=0.06)
+    prompts = np.stack([generate_prompt(cfg, 2, 1, 1), edit_prompt(cfg, 2, 0)])
+    tokens = torch.as_tensor(prompts, dtype=torch.long)
+    group = model.bottleneck.prior_index(tokens)[1]
+    counts = torch.zeros(len(model.bottleneck.prior_mean))
+    first = torch.zeros_like(model.bottleneck.prior_mean)
+    second = torch.zeros_like(first)
+    counts[group] = 2
+    first[group] = 2 * 0.2
+    second[group] = 2 * (0.2 ** 2 + 0.5 ** 2)
+    model.bottleneck.fit_prior(counts, first, second)
+    source = torch.zeros(2, cfg["image_size"], cfg["image_size"], 3)
+    mean = model.condition(tokens, source)
+    sampled, kl, std = model.bottleneck(mean, torch.Generator().manual_seed(12), prompt=tokens)
+    torch.testing.assert_close(sampled.instruction, mean.instruction, rtol=0, atol=0)
+    torch.testing.assert_close(sampled.visual[0], mean.visual[0], rtol=0, atol=0)
+    assert not torch.equal(sampled.visual[1], mean.visual[1])
+    torch.testing.assert_close(std, torch.tensor([0.0, 0.03]))
+    expected_kl = torch.distributions.kl_divergence(
+        torch.distributions.Normal(mean.visual[1], 0.03), torch.distributions.Normal(0.2, 0.5),
+    ).sum()
+    torch.testing.assert_close(kl, torch.stack((torch.zeros_like(expected_kl), expected_kl)))
+    other, target_kl, _ = model.bottleneck(
+        mean, torch.Generator().manual_seed(12), prompt=tokens, reference=torch.ones_like(mean.visual),
+    )
+    torch.testing.assert_close(other.visual, sampled.visual, rtol=0, atol=0)
+    assert target_kl[1] != kl[1]
+    inactive, inactive_kl, _ = model.bottleneck(
+        mean, torch.Generator().manual_seed(12), prompt=tokens, active=torch.zeros(2, dtype=torch.bool),
+    )
+    torch.testing.assert_close(inactive.visual, mean.visual, rtol=0, atol=0)
+    torch.testing.assert_close(inactive_kl, torch.zeros_like(kl), rtol=0, atol=0)
+
+    path = save_checkpoint(
+        cfg, "posttrain", flow_state(model, True), 1, 0.0, direct_source=False, bottleneck_kind="conditional",
+        posttrain={"max_std_ratio": 0.06},
+    )
+    pipeline = Pipeline(cfg, torch.device("cpu"), path)
+    assert pipeline.model.bottleneck.max_log_ratio == model.bottleneck.max_log_ratio
+    torch.testing.assert_close(pipeline.model.bottleneck.prior_scale, model.bottleneck.prior_scale)
+    images = np.full((1, cfg["image_size"], cfg["image_size"], 3), 128, dtype=np.uint8)
+    region = np.ones(images.shape[:3], dtype=bool)
+    first = pipeline.edit(images, prompts[1:], region=region, steps=2, seed=44).raw
+    second = pipeline.edit(images, prompts[1:], region=region, steps=2, seed=44).raw
+    np.testing.assert_array_equal(first, second)
+
+
+@torch.no_grad()
+def test_appearance_bottleneck_preserves_orthogonal_query_coordinates():
+    cfg = load_config(smoke=True)
+    cfg["model"].update(visual_tokens=2, visual_dim=4, instruction_dim=8)
+    bottleneck = ConditionalVisualBottleneck(cfg, appearance_rank=2)
+    tokens = torch.as_tensor(edit_prompt(cfg, 2, 0), dtype=torch.long)[None].expand(4, -1)
+    differences = torch.zeros(4, 8)
+    differences[0, 2], differences[1, 2] = 2, -2
+    differences[2, 6], differences[3, 6] = 1, -1
+    bottleneck.fit_appearance_prior(differences.view(4, 2, 4), bottleneck.prior_index(tokens))
+    mean = FlowCondition(torch.zeros(4, 8), torch.zeros(4, 2, 4))
+    sampled, kl, _ = bottleneck(mean, torch.Generator().manual_seed(12), prompt=tokens)
+    delta = sampled.visual.flatten(1)
+    projected = delta @ bottleneck.basis @ bottleneck.basis.T
+    torch.testing.assert_close(delta, projected)
+    assert delta.abs().sum() > 0 and torch.isfinite(kl).all()
+
+
+@torch.no_grad()
+def test_protected_query_is_excluded_from_noise_and_rate():
+    cfg = load_config(smoke=True)
+    cfg["model"].update(visual_tokens=2, visual_dim=4, instruction_dim=8)
+    bottleneck = ConditionalVisualBottleneck(cfg, protected_tokens=1)
+    prompt = torch.as_tensor(edit_prompt(cfg, 2, 0), dtype=torch.long)[None]
+    mean = FlowCondition(torch.zeros(1, 8), torch.zeros(1, 2, 4))
+    sampled, kl, _ = bottleneck(mean, torch.Generator().manual_seed(12), prompt=prompt)
+    mean.visual[:, 0] = 5.0
+    changed, changed_kl, _ = bottleneck(mean, torch.Generator().manual_seed(12), prompt=prompt)
+    torch.testing.assert_close(changed.visual[:, 0], mean.visual[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(changed.visual[:, 1], sampled.visual[:, 1], rtol=0, atol=0)
+    torch.testing.assert_close(changed_kl, kl, rtol=0, atol=0)

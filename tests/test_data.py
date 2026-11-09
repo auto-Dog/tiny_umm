@@ -5,6 +5,7 @@ import pytest
 
 from data.build_dataset import build, heldout_set
 from data.dataset import load_group
+from data.paired_edits import read_pairs, render_pairs, source_fingerprint
 from data.renderer import make_background, make_noise_field, render_objects, shape_coverage, shape_mask
 from data.schema import load_config, palette, understand_prompt
 from evaluation.metrics import SceneOracle
@@ -45,6 +46,18 @@ def test_dataset_splits_and_edit_invariants(artifact_dir):
         assert np.all(angles[padded] == 0)
         angle_id = angles[~padded] * 12 / (2 * np.pi)
         np.testing.assert_allclose(angle_id, np.rint(angle_id), atol=1e-5)
+
+    train = load_group(cfg, "train")
+    peers, attrs = render_pairs(cfg, train, seed=731)
+    assert set(zip(train["counts"], attrs[:, 0], attrs[:, 1])).isdisjoint(heldout)
+    outside = ~train["region_masks"].astype(bool)
+    np.testing.assert_array_equal(peers[outside], train["images"][outside])
+    assert np.any(peers != train["images"])
+    pair_path = artifact_dir / "pairs.npz"
+    np.savez(pair_path, images=peers, source_sha256=source_fingerprint(train))
+    np.testing.assert_array_equal(read_pairs(pair_path, train), peers)
+    with pytest.raises(ValueError, match="does not match"):
+        read_pairs(pair_path, {**train, "scene_ids": train["scene_ids"] + 1})
 
 
 def test_rotated_triangle_stays_inside_fixed_square_and_has_partial_pixels():

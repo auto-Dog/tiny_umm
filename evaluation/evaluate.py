@@ -37,18 +37,23 @@ def batches(indices: np.ndarray, cfg: dict):
 
 def generation_report(
     pipeline: Pipeline, data: dict, indices: np.ndarray, oracle: SceneOracle, *,
-    steps: int | None, seed: int, gain: float | None = None, understanding=None,
+    steps: int | None, seed: int, gain: float | None = None, understanding=None, record_joint: bool = False,
 ) -> dict:
     scores = AttributeScores()
     truth = data["prompts_gen"][indices, 1:].astype(np.int64)
     generated = []
+    joint_hits = []
     for start, idx in batches(indices, pipeline.cfg):
         images = pipeline.generate(data["prompts_gen"][idx], steps=steps, seed=seed + start, gain=gain)
         for image, attrs in zip(images, truth[start:start + len(idx)]):
-            scores.add(oracle.parse(image), tuple(attrs))
+            hit = scores.add(oracle.parse(image), tuple(attrs))
+            if record_joint:
+                joint_hits.append(hit)
         if understanding is not None:
             generated.append(images)
     result = {"oracle": scores.report()}
+    if record_joint:
+        result["joint_hits"] = joint_hits
     if understanding is not None:
         cfg = pipeline.cfg
         predicted = predict_understanding(understanding, np.concatenate(generated), cfg, pipeline.device)
@@ -78,10 +83,11 @@ def diversity_report(
 
 def editing_report(
     pipeline: Pipeline, data: dict, indices: np.ndarray, oracle: SceneOracle, *,
-    steps: int | None, seed: int, gain: float | None = None, direct: bool | None = None,
+    steps: int | None, seed: int, gain: float | None = None, direct: bool | None = None, record_joint: bool = False,
 ) -> dict:
     names = ("raw", "constrained", "gt_region_oracle")
     attrs = {key: AttributeScores() for key in names}
+    joint_hits = {key: [] for key in names}
     outside = {key: PixelScores() for key in names}
     inpaint = {key: PixelScores() for key in names}
     geometry = {key: GeometryScores() for key in names}
@@ -104,7 +110,9 @@ def editing_report(
             upper = constrain_edit(sources[j], sampled.raw[j], gt_region)
             for name, image in zip(names, (sampled.raw[j], sampled.constrained[j], upper)):
                 parsed = oracle.parse(image)
-                attrs[name].add(parsed, truth)
+                hit = attrs[name].add(parsed, truth)
+                if record_joint:
+                    joint_hits[name].append(hit)
                 outside[name].add(image, sources[j], ~gt_region)
                 inpaint[name].add(image, target, exposed)
                 geometry[name].add(parsed, data["centers"][i, :n], data["sizes"][i, :n])
@@ -117,6 +125,8 @@ def editing_report(
             **attr, "outside_gt_region": outside[name].report(), "inpainting": inpaint[name].report(),
             "geometry": geometry[name].report(),
         }
+        if record_joint:
+            result[name]["joint_hits"] = joint_hits[name]
     result["constrained"]["outside_selected_region"] = outside_selected.report()
     result["localization"] = dict(zip(("iou", "coverage", "precision"), np.mean(localization, axis=0).tolist()))
     result["direct_source"] = pipeline.metadata["direct_source"] if direct is None else direct
@@ -191,6 +201,7 @@ def _options() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=positive_int, help="limit samples per split")
     parser.add_argument("--batch-size", type=positive_int)
     parser.add_argument("--steps", type=positive_int)
+    parser.add_argument("--record-joint", action="store_true", help="save per-scene joint hits for paired comparisons")
     parser.add_argument("--out", type=Path)
     return parser
 
@@ -253,14 +264,19 @@ def evaluate(args: argparse.Namespace) -> Path:
             print(f"[{split}] evaluating {name} on {len(idx)} scenes", flush=True)
             variant = {}
             if args.checkpoint and args.task in (None, "understand") and pipeline.model.bridge is not None:
-                after = predict_understanding(pipeline.model.understanding, data["images"][idx], cfg, device)
+                after = predict_understanding(pipeline.model, data["images"][idx], cfg, device, seed=seed + 20_000)
                 variant["understanding"] = {
                     **classification_metrics(targets, after, class_counts(cfg)),
                     "predictions_identical": all(np.array_equal(before[key], after[key]) for key in before),
                 }
+                if args.record_joint:
+                    variant["understanding"]["joint_hits"] = np.logical_and.reduce([
+                        targets[key] == after[key] for key in targets
+                    ]).tolist()
             if args.task in (None, "generate"):
                 variant["generation"] = generation_report(
                     pipeline, data, idx, oracle, steps=args.steps, seed=seed, understanding=understanding,
+                    record_joint=args.record_joint,
                 )
                 variant["generation"]["diversity"] = diversity_report(
                     pipeline, data, idx, steps=args.steps, seed=seed + 100_000,
@@ -268,6 +284,7 @@ def evaluate(args: argparse.Namespace) -> Path:
             if args.task in (None, "edit"):
                 variant["editing"] = editing_report(
                     pipeline, data, idx, oracle, steps=args.steps, seed=seed + 10_000,
+                    record_joint=args.record_joint,
                 )
             result["variants"][name] = variant
         if args.all:

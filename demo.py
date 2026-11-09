@@ -21,9 +21,9 @@ def demo(args: argparse.Namespace) -> Path:
     seed = cfg["seed"] + 800
     idx = sample_indices(data, args.samples, seed)
     source = data["images"][idx]
-    u = load_understanding(cfg, device)
-    pred = predict_understanding(u, source, cfg, device)
     pipeline = Pipeline(cfg, device, args.checkpoint)
+    u = pipeline.model if pipeline.model.text_aux is not None else load_understanding(cfg, device)
+    pred = predict_understanding(u, source, cfg, device, seed=seed)
     generated = pipeline.generate(data["prompts_gen"][idx], steps=args.steps, seed=seed)
     edits = pipeline.edit(source, data["prompts_edit"][idx], steps=args.steps, seed=seed + 1)
     chain_idx = idx[:min(3, len(idx))]

@@ -230,15 +230,17 @@ class AttributeScores:
         self.correct = np.zeros(3, dtype=np.int64)
         self.count_error = 0
 
-    def add(self, parsed: ParsedScene, target: tuple[int, int, int]) -> None:
+    def add(self, parsed: ParsedScene, target: tuple[int, int, int]) -> bool:
         self.n += 1
         self.parsed += parsed.parsed
         matches = [getattr(parsed, key) == value for key, value in zip(ATTRIBUTES, target)]
         self.correct += matches
-        self.joint += all(matches)
+        joint = all(matches)
+        self.joint += joint
         if parsed.count is not None:
             self.count_parsed += 1
             self.count_error += abs(parsed.count - target[0])
+        return joint
 
     def report(self) -> dict:
         n = self.n

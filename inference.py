@@ -17,6 +17,7 @@ from data.schema import OP_EDIT, OP_GENERATE, edit_prompt, generate_prompt, get_
 from evaluation.metrics import SceneOracle
 from models.checkpoints import checkpoint_path, load_flow, load_understanding
 from models.flow import FlowCondition, sample_flow
+from models.tiny_umm import TinyUMM
 
 
 @dataclass
@@ -51,13 +52,16 @@ class Pipeline:
             raise ValueError("expected a nonempty batch of four-slot prompts for this operation")
         return torch.as_tensor(prompts, dtype=torch.long, device=self.device)
 
-    def _sample(self, condition: FlowCondition, steps: int | None, seed: int | None, gain: float) -> np.ndarray:
+    def _sample(
+        self, condition: FlowCondition, steps: int | None, seed: int | None, gain: float, *, prompt: torch.Tensor,
+        active: torch.Tensor | None = None,
+    ) -> np.ndarray:
         settings = self.cfg["sampling"]
         seed = self.cfg["seed"] if seed is None else seed
         generator = torch.Generator(device=self.device).manual_seed(seed)
         if self.model.bottleneck is not None:
             latent_noise = torch.Generator(device=self.device).manual_seed(seed ^ 0x5EED)
-            condition, _, _ = self.model.bottleneck(condition, latent_noise)
+            condition, _, _ = self.model.bottleneck(condition, latent_noise, prompt=prompt, active=active)
         condition.instruction = gain * condition.instruction
         result = sample_flow(
             self.model.flow, condition, steps=settings["steps"] if steps is None else steps,
@@ -73,7 +77,7 @@ class Pipeline:
         tokens = self._tokens(prompts, OP_GENERATE)
         if gain is None:
             gain = self.cfg["sampling"]["generation_instruction_gain"]
-        return self._sample(self.model.condition(tokens), steps, seed, gain)
+        return self._sample(self.model.condition(tokens), steps, seed, gain, prompt=tokens)
 
     @torch.inference_mode()
     def edit(
@@ -101,7 +105,10 @@ class Pipeline:
             gain = self.cfg["sampling"]["edit_instruction_gain"]
         source = torch.as_tensor(normalize_images(images), device=self.device)
         condition = self.model.condition(tokens, source, direct=direct)
-        raw = self._sample(condition, steps, seed, gain)
+        active = None
+        if self.metadata.get("posttrain", {}).get("same_color_edits"):
+            active = self.model.keeps_source_color(tokens, source)
+        raw = self._sample(condition, steps, seed, gain, prompt=tokens, active=active)
         return EditResult(raw, constrain_edit(images, raw, region), region)
 
     def chain(
@@ -121,15 +128,21 @@ class Pipeline:
 
 
 @torch.inference_mode()
-def predict_understanding(model, images: np.ndarray, cfg: dict, device: torch.device) -> dict[str, np.ndarray]:
+def predict_understanding(
+    model, images: np.ndarray, cfg: dict, device: torch.device, *, seed: int | None = None,
+) -> dict[str, np.ndarray]:
     batch_size = cfg["evaluation"]["batch_size"]
     if batch_size < 1:
         raise ValueError("evaluation.batch_size must be positive")
     token = torch.as_tensor(understand_prompt(cfg), dtype=torch.long, device=device)
+    generator = torch.Generator(device=device).manual_seed(cfg["seed"] if seed is None else seed)
     predictions = {"count": [], "color": [], "shape": []}
     for start in range(0, len(images), batch_size):
         x = torch.as_tensor(normalize_images(images[start:start + batch_size]), device=device)
-        logits = model(x, token[None].expand(len(x), -1))
+        if isinstance(model, TinyUMM):
+            logits = model.classify(x, generator=generator)
+        else:
+            logits = model(x, token[None].expand(len(x), -1))
         for name, value in logits.items():
             predictions[name].append(value.argmax(dim=-1).cpu().numpy())
     return {name: np.concatenate(values) for name, values in predictions.items()}
@@ -239,7 +252,7 @@ def run(args: argparse.Namespace) -> dict:
     batch_size = cfg["evaluation"]["batch_size"]
     if args.command == "understand":
         model = load_understanding(cfg, device, args.checkpoint)
-        prediction = predict_understanding(model, read_image(args.image, size)[None], cfg, device)
+        prediction = predict_understanding(model, read_image(args.image, size)[None], cfg, device, seed=seed)
         return {
             "count": int(prediction["count"][0]) + 1,
             "color": cfg["colors"]["names"][prediction["color"][0]],

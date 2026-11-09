@@ -29,6 +29,30 @@ def test_linear_flow_path_and_midpoint_integration():
     torch.testing.assert_close(result, start + 0.4)
 
 
+def test_velocity_distillation_reuses_flow_path_and_stops_teacher_gradients():
+    class ConstantVelocity(nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = nn.Parameter(torch.tensor(value))
+
+        def forward(self, x, t, condition):
+            self.t = t
+            return self.value.expand_as(x)
+
+    student, teacher = ConstantVelocity(1.0), ConstantVelocity(2.0)
+    target = torch.zeros(2, 4, 4, 3)
+    condition = FlowCondition(torch.zeros(2, 1), torch.zeros(2, 1, 1))
+    weights = torch.tensor([0.0, 3.0])
+    ordinary = flow_matching_errors(student, target, condition, torch.Generator().manual_seed(11))
+    distilled = flow_matching_errors(
+        student, target, condition, torch.Generator().manual_seed(11), teacher=(teacher, condition, weights),
+    )
+    torch.testing.assert_close(student.t, teacher.t)
+    torch.testing.assert_close(distilled - ordinary, weights * (1 - teacher.t).square())
+    distilled.sum().backward()
+    assert student.value.grad is not None and teacher.value.grad is None
+
+
 @pytest.mark.parametrize("bridge", ["connector", "discrete"])
 def test_frozen_flow_passes_gradients_to_visual_bridge(bridge):
     torch.manual_seed(10)

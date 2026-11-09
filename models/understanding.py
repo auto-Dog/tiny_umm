@@ -43,3 +43,21 @@ class UnderstandingMLP(nn.Module):
         h = self.encode_image(image)
         fused = self.fusion(torch.cat((h, self.instruction(prompt)), dim=-1))
         return {name: head(fused) for name, head in self.heads.items()}
+
+
+class SharedUnderstandingHead(nn.Module):
+    """Decode answer slots from the shared Flow's probe features."""
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        model = cfg["model"]
+        width = model["understanding"]["feature_dim"]
+        probe_dim = 4 * 4 * (model["flow"]["width"] + 3)
+        self.fusion = nn.Sequential(nn.Linear(probe_dim, width), nn.LayerNorm(width), nn.GELU())
+        self.heads = nn.ModuleDict({
+            name: nn.Linear(width, n) for name, n in zip(ATTRIBUTES, class_counts(cfg))
+        })
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        fused = self.fusion(features)
+        return {name: head(fused) for name, head in self.heads.items()}
