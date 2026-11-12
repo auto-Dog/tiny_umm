@@ -3,7 +3,7 @@ import torch
 
 from configs.base_models import base_recipe
 from data.schema import edit_prompt, load_config, understand_prompt
-from models.base_checkpoints import BASE_TYPES
+from models.checkpoints import BASE_TYPES
 
 
 def model_for(kind):

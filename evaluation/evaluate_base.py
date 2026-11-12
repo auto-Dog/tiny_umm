@@ -11,7 +11,7 @@ from configs.base_models import BASE_MODELS, base_recipe
 from data.dataset import denormalize_images, load_group, normalize_images, task_labels
 from data.schema import TASK_UNDERSTAND, TASKS, get_device, load_config, save_json, understand_prompt
 from inference import EditResult, constrain_edit, positive_int
-from models.base_checkpoints import base_checkpoint_path, load_base_checkpoint
+from models.checkpoints import base_checkpoint_path, load_base_checkpoint
 from models.understanding import ATTRIBUTES, class_counts
 
 from .evaluate import batches, diversity_report, editing_report, generation_report, sample_indices

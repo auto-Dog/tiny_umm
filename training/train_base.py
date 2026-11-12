@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from configs.base_models import BASE_MODELS, base_recipe
 from data.dataset import load_group, normalize_images, take_images, task_labels, task_prompts
 from data.schema import TASK_EDIT, TASK_GENERATE, TASK_UNDERSTAND, TASKS
-from models.base_checkpoints import BASE_TYPES, save_base_checkpoint
+from models.checkpoints import BASE_TYPES, save_base_checkpoint
 from models.emu3 import TinyEmu3
 from models.understanding import ATTRIBUTES
 
