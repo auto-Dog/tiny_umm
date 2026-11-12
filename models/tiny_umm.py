@@ -54,10 +54,14 @@ class TinyUMM(nn.Module):
         return self.read_text(condition)
 
     def read_text(self, condition: FlowCondition) -> dict[str, torch.Tensor]:
+        return self.text_aux(self.query_features(condition))
+
+    def query_features(self, condition: FlowCondition) -> torch.Tensor:
+        """Read the shared decoder using only its sampled query and instruction inputs."""
         if self.text_aux is None:
             raise ValueError("model has no shared understanding head")
         probe = self.understand_probe.expand(len(condition.instruction), -1, -1, -1)
-        return self.text_aux(self.flow.probe_features(probe, condition))
+        return self.flow.probe_features(probe, condition)
 
     @torch.no_grad()
     def keeps_source_color(self, prompt: torch.Tensor, source: torch.Tensor) -> torch.Tensor:

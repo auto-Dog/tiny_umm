@@ -1,10 +1,11 @@
-"""Train the shared TinyUMM with Flow Matching, text CE and optional conditional query KL."""
+"""Train shared TinyUMM with conditional IB, task matching and optional learned KL weights."""
 from __future__ import annotations
 
 import math
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ from models.understanding import ATTRIBUTES, class_counts
 
 from .common import arguments, batch_slices, mixed_indices, mixed_precision, setup
 from .train_flow import flow_batch
+from .query_objectives import MatchingPairs, QueryObjectives, masked_mean, validate_matching
 
 
 def labels_at(labels: dict, idx: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -207,7 +209,34 @@ def validate(
     return {"scenes": n, **result}
 
 
+def configure_objective(args) -> None:
+    """Keep legacy defaults and give the paired ablations the same low-noise channel."""
+    uses_ib = args.objective in ("ib", "ib_itm", "dynamic_itm")
+    if args.edit_beta is None:
+        args.edit_beta = 0.0006 if uses_ib else 0.0
+    if args.posterior_std is None:
+        args.posterior_std = 0.003 if args.objective else 0.0
+    if args.objective:
+        args.target_prior = args.target_prior or "geometry"
+        if args.objective in ("baseline", "itm") and (args.edit_beta or args.text_beta):
+            raise ValueError("baseline and itm objectives require zero edit and text KL weights")
+        if uses_ib and args.edit_beta <= 0:
+            raise ValueError("IB objectives require a positive edit KL weight")
+        if args.posterior_std <= 0:
+            raise ValueError("paired objectives require a positive fixed posterior std")
+    if not 0 < args.itm_label_fraction <= 1:
+        raise ValueError("ITM label fraction must be in (0, 1]")
+    if not 0 <= args.beta_span < 1 or not 0 < args.probe_erase < 1:
+        raise ValueError("beta span must be in [0, 1) and probe erasure probability in (0, 1)")
+    if any(not math.isfinite(value) or value <= 0 for value in (
+        args.itm_weight, args.controller_weight, args.controller_temperature,
+    )):
+        raise ValueError("matching and controller weights and temperature must be finite and positive")
+
+
 def train(cfg: dict, device: torch.device, args) -> Path:
+    configure_objective(args)
+    started = perf_counter()
     if any(not math.isfinite(value) or value <= 0 for value in (args.lr, args.text_weight, args.prior_std)):
         raise ValueError("learning rate, text weight and prior std must be finite and positive")
     if not 0 < args.generation_ratio < 1:
@@ -249,6 +278,15 @@ def train(cfg: dict, device: torch.device, args) -> Path:
         model, cfg, train_data, labels, device, amp, args.seed, args.target_prior,
     ) if args.target_prior else None
     diagnostic = SharedQueryBottleneck(args.posterior_std or 0.03) if prior is not None else None
+    auxiliary = None
+    pairs = None
+    if args.objective in ("itm", "ib_itm", "dynamic_itm"):
+        auxiliary = QueryObjectives(cfg, args).to(device)
+        if "matching_state" in saved:
+            auxiliary.matcher.load_state_dict(saved["matching_state"]["matcher"])
+            if auxiliary.controller is not None and "controller" in saved["matching_state"]:
+                auxiliary.controller.load_state_dict(saved["matching_state"]["controller"])
+        pairs = MatchingPairs(train_data, args.seed + 4, args.itm_label_fraction)
     teacher_path = checkpoint_path(cfg, "flow") if args.spatial_teacher else None
     teacher = None
     if teacher_path is not None:
@@ -257,6 +295,8 @@ def train(cfg: dict, device: torch.device, args) -> Path:
             raise ValueError("spatial distillation requires a Stage B checkpoint")
         teacher.requires_grad_(False).to(memory_format=torch.channels_last)
     groups = trainable_groups(model, args.lr)
+    if auxiliary is not None:
+        groups += auxiliary.optimizer_groups(args.lr)
     params = [p for group in groups for p in group["params"]]
     start_weights = [p.detach().clone() for p in params]
     optimizer = torch.optim.AdamW(groups, weight_decay=cfg["training"]["weight_decay"], fused=device.type == "cuda")
@@ -264,13 +304,16 @@ def train(cfg: dict, device: torch.device, args) -> Path:
     fm = torch.Generator(device=device).manual_seed(args.seed + 1)
     latent = torch.Generator(device=device).manual_seed(args.seed + 2)
     text_latent = torch.Generator(device=device).manual_seed(args.seed + 3)
+    negatives = torch.Generator(device=device).manual_seed(args.seed + 4)
+    probes = torch.Generator(device=device).manual_seed(args.seed + 5)
     rng = np.random.default_rng(args.seed)
     order_hash = sha256()
     history = []
     step, seen, seen_edit, last_log = 0, 0, 0, 0
     totals = torch.zeros(6, device=device)
+    matching_totals = {}
     ramp = max(1, args.steps // 5)
-    print(f"[shared] {sum(p.numel() for p in params):,} parameters on {device}, "
+    print(f"[shared {args.objective or 'legacy'}] {sum(p.numel() for p in params):,} parameters on {device}, "
           f"seed={args.seed}, beta=({args.edit_beta:g}, {args.text_beta:g}), "
           f"std={args.posterior_std:g}, {args.steps} steps", flush=True)
     while step < args.steps:
@@ -300,17 +343,36 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                 ).mean()
                 text_mean = model.condition(text_prompt, source)
                 text_condition = sampled_condition(model, text_mean, text_latent, text_prompt)
-                ce = text_errors(model.read_text(text_condition), gold).mean()
+                text_features = model.query_features(text_condition)
+                ce = text_errors(model.text_aux(text_features), gold).mean()
+                edit_rows = prompt[:, 0] == OP_EDIT
+                extra_loss = fm_loss.new_zeros(())
+                edit_multiplier, text_multiplier = torch.ones_like(prompt[:, 0], dtype=torch.float32), 1.0
+                matching_metrics = {}
+                if auxiliary is not None:
+                    batch = auxiliary.prepare(pairs, idx, gold, edit_rows, prior.model.source_encoder, negatives)
+                    dynamic_scale = min(1.0, max(0.0, (step + 1 - ramp) / ramp))
+                    extra_loss, edit_multiplier, text_multiplier, matching_metrics = auxiliary.losses(
+                        model, condition, text_condition, text_features, batch, probes, dynamic_scale,
+                    )
                 edit_rate, text_rate = fm_loss.new_zeros(()), fm_loss.new_zeros(())
+                rate_loss = fm_loss.new_zeros(())
                 if prior is not None:
                     edit_reference = prior.edit(prompt, source, target)
-                    edit_rate = (prior.edit_rate(diagnostic, mean.visual, edit_reference, args.prior_std)
-                                 * (prompt[:, 0] == OP_EDIT)).mean()
-                    text_rate = diagnostic.rate(text_mean.visual, prior.text(gold), args.prior_std).mean()
+                    edit_rates = prior.edit_rate(diagnostic, mean.visual, edit_reference, args.prior_std) * edit_rows
+                    text_rates = diagnostic.rate(text_mean.visual, prior.text(gold), args.prior_std)
+                    edit_rate, text_rate = edit_rates.mean(), text_rates.mean()
+                    rate_loss = args.edit_beta * (edit_rates * edit_multiplier).mean()
+                    rate_loss += args.text_beta * (text_rates * text_multiplier).mean()
+                if auxiliary is not None:
+                    beta = args.edit_beta * edit_multiplier
+                    beta_mean = masked_mean(beta, edit_rows)
+                    matching_metrics.update(
+                        edit_beta_mean=beta_mean,
+                        edit_beta_std=masked_mean((beta - beta_mean).square(), edit_rows).sqrt(),
+                    )
                 rate_scale = min(1.0, (step + 1) / ramp)
-                loss = fm_loss + args.text_weight * ce + rate_scale * (
-                    args.edit_beta * edit_rate + args.text_beta * text_rate
-                )
+                loss = fm_loss + args.text_weight * ce + rate_scale * rate_loss + extra_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if step == 0:
@@ -319,7 +381,8 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                         p.grad.detach().float().square().sum().item() for p in group["params"] if p.grad is not None
                     ) ** 0.5 for group in groups
                 }
-                if any(not math.isfinite(value) or value <= 0 for value in first_gradient_l2.values()):
+                if any(not math.isfinite(value) or (value <= 0 and name not in ("itm", "beta_controller"))
+                       for name, value in first_gradient_l2.items()):
                     raise RuntimeError(f"shared training path has missing or nonfinite gradients: {first_gradient_l2}")
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, grad_clip, error_if_nonfinite=True)
@@ -331,14 +394,20 @@ def train(cfg: dict, device: torch.device, args) -> Path:
             query_mean_sq = mean.visual.detach().float().square().flatten(1).mean(dim=1)
             query_mean_sq = (query_mean_sq * edit_rows).sum() / edit_rows.sum().clamp_min(1)
             totals += torch.stack((fm_loss, ce, edit_rate, text_rate, loss, query_mean_sq)).detach()
+            for name, value in matching_metrics.items():
+                matching_totals[name] = matching_totals.get(name, 0.0) + value.detach()
             if step % args.log_every == 0 or step == args.steps:
                 values = (totals / (step - last_log)).tolist()
                 names = ("fm", "text_ce", "edit_kl_per_example_per_dim", "text_kl_per_dim", "loss")
                 query_rms = math.sqrt(values[5])
-                history.append({"step": step, **dict(zip(names, values[:5])), "edit_query_rms": query_rms})
+                matching_log = {name: (value / (step - last_log)).item() for name, value in matching_totals.items()}
+                history.append({"step": step, **dict(zip(names, values[:5])), "edit_query_rms": query_rms, **matching_log})
+                suffix = (f" ITM={matching_log['itm_loss']:.4f} beta_std={matching_log['edit_beta_std']:.6f}"
+                          if matching_log else "")
                 print(f"[shared {step}/{args.steps}] FM={values[0]:.5f} CE={values[1]:.5f} "
-                      f"edit_KL={values[2]:.4f} text_KL={values[3]:.4f} edit_query_rms={query_rms:.4f}", flush=True)
+                      f"edit_KL={values[2]:.4f} text_KL={values[3]:.4f} edit_query_rms={query_rms:.4f}{suffix}", flush=True)
                 totals.zero_()
+                matching_totals.clear()
                 last_log = step
             if step == args.steps:
                 break
@@ -352,6 +421,8 @@ def train(cfg: dict, device: torch.device, args) -> Path:
         ) ** 0.5
         offset += len(weights)
     after = validate(model, cfg, val, device, args, prior, diagnostic)
+    if auxiliary is not None:
+        after["matching"] = validate_matching(auxiliary, model, prior.model.source_encoder, cfg, val, device, args)
     score = (after["generation_fm"] + after["edit_fm"]) / 2
     if not math.isfinite(score) or not math.isfinite(after["text_ce"]):
         raise RuntimeError("shared validation loss is not finite")
@@ -371,18 +442,35 @@ def train(cfg: dict, device: torch.device, args) -> Path:
         "teacher_sha256": sha256(teacher_path.read_bytes()).hexdigest() if teacher_path is not None else None,
         "kl_ramp_steps": ramp, "first_gradient_l2": first_gradient_l2, "parameter_delta_l2": parameter_delta_l2,
         "trainable_parameters": sum(p.numel() for p in params),
+        "objective": args.objective or "legacy", "elapsed_seconds": perf_counter() - started,
+        "fm_rng_sha256": sha256(fm.get_state().cpu().numpy().tobytes()).hexdigest(),
+        "latent_rng_sha256": sha256(latent.get_state().cpu().numpy().tobytes()).hexdigest(),
+        "text_latent_rng_sha256": sha256(text_latent.get_state().cpu().numpy().tobytes()).hexdigest(),
     }
+    matching_state = {}
+    if auxiliary is not None:
+        settings.update(
+            itm_weight=args.itm_weight, itm_label_fraction=args.itm_label_fraction,
+            itm_labeled_scenes=int(pairs.labeled.sum()), itm_edit_negative_scenes=int((pairs.negative >= 0).sum()),
+            matching_pairs_sha256=pairs.fingerprint(), beta_span=args.beta_span,
+            controller_weight=args.controller_weight, controller_temperature=args.controller_temperature,
+            probe_erase=args.probe_erase, dynamic_warmup_steps=ramp, dynamic_ramp_steps=ramp,
+        )
+        matching_state["matcher"] = auxiliary.matcher.state_dict()
+        if auxiliary.controller is not None:
+            matching_state["controller"] = auxiliary.controller.state_dict()
     output_cfg = {**cfg, "paths": {**cfg["paths"], "checkpoint_dir": str(args.run_dir)}}
     path = save_checkpoint(
         output_cfg, "shared", flow_state(model, connected=True), saved["epoch"], score, direct_source=False,
         posttrain=settings, **({"bottleneck_kind": "shared_query"} if model.bottleneck is not None else {}),
+        **({"matching_state": matching_state} if matching_state else {}),
     )
     save_json(args.run_dir / "history.json", {**settings, "validation": after, "train": history})
     print(f"Validation: {after}", flush=True)
     return path
 
 
-def main() -> None:
+def _options():
     parser = arguments(__doc__)
     parser.add_argument("--base-checkpoint", type=Path)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -391,13 +479,13 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--text-weight", type=float, default=0.08)
     parser.add_argument("--generation-ratio", type=float, default=0.30)
-    parser.add_argument("--posterior-std", type=float, default=0.0)
+    parser.add_argument("--posterior-std", type=float, help="fixed query noise, default 0.003 for named objectives")
     parser.add_argument("--prior-std", type=float, default=0.35)
     parser.add_argument(
         "--target-prior", nargs="?", const="query", choices=("query", "regressed", "spatial", "geometry", "anchor"),
         help="target query, target ridge, target ridge with spatial features or geometry covariance, or source anchor",
     )
-    parser.add_argument("--edit-beta", type=float, default=0.0, help="signed edit KL weight, negative for the sign control")
+    parser.add_argument("--edit-beta", type=float, help="edit KL weight, default 0.0006 for named IB objectives")
     parser.add_argument("--text-beta", type=float, default=0.0)
     parser.add_argument("--foreground-weight", type=float, default=0.0, help="extra training FM weight on target foreground")
     parser.add_argument("--spatial-teacher", type=float, default=0.0, help="training-only Stage B edit velocity loss weight")
@@ -405,6 +493,18 @@ def main() -> None:
     parser.add_argument("--device")
     parser.add_argument("--val-samples", type=positive_int, default=512)
     parser.add_argument("--log-every", type=positive_int, default=100)
+    parser.add_argument("--objective", choices=("baseline", "ib", "itm", "ib_itm", "dynamic_itm"))
+    parser.add_argument("--itm-weight", type=float, default=0.02)
+    parser.add_argument("--itm-label-fraction", type=float, default=1.0, help="fraction of scenes labeling the matching branch")
+    parser.add_argument("--controller-weight", type=float, default=0.01)
+    parser.add_argument("--controller-temperature", type=float, default=0.05, help="scale of matching harm after erasing queries")
+    parser.add_argument("--beta-span", type=float, default=0.9, help="bound on relative beta variation around its batch mean")
+    parser.add_argument("--probe-erase", type=float, default=0.5, help="probability of erasing a query in controller probes")
+    return parser
+
+
+def main() -> None:
+    parser = _options()
     args = parser.parse_args()
     try:
         cfg, device = setup(args, device_override=args.device)
