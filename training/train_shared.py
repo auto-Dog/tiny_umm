@@ -271,7 +271,8 @@ def configure_objective(args) -> None:
         raise ValueError("beta span must be in [0, 1) and probe erasure probability in (0, 1)")
     if args.objective == "signed_itm" and not (
         0 < args.edit_beta < args.beta_max and abs(args.text_beta) < args.beta_max and 0 <= args.signed_span < 0.5
-        and args.nce_scale > 0 and 0 < args.fd_step < 1e-2 and args.controller_lr > 0
+        and args.nce_scale > 0 and 0 < args.fd_step < 1e-2 and args.controller_lr > 0 and args.sign_lr > 0
+        and args.beta_anchor > 0
     ):
         raise ValueError("signed_itm needs 0 < edit beta < beta max, |text beta| < beta max, span in [0, 0.5), "
                          "positive NCE scale and controller lr, and a small finite-difference step")
@@ -341,8 +342,12 @@ def train(cfg: dict, device: torch.device, args) -> Path:
             torch.manual_seed(args.seed + 8)
             signed = SignedBeta(cfg, args.beta_max, (args.edit_beta,) * 3 + (args.text_beta,), args.signed_span)
         signed.to(device)
-        signed_optimizer = torch.optim.AdamW(signed.parameters(), lr=args.controller_lr,
-                                             weight_decay=cfg["training"]["weight_decay"])
+        # Momentum SGD keeps the context step proportional to the alignment; the bounded A head uses AdamW.
+        signed_optimizers = (
+            torch.optim.SGD(signed.sign.parameters(), lr=args.sign_lr, momentum=0.9),
+            torch.optim.AdamW(signed.modulation.parameters(), lr=args.controller_lr,
+                              weight_decay=cfg["training"]["weight_decay"]),
+        )
         nce_tau_sq = calibrate_nce_temperature(model, train_data, device, amp, args.seed)
         alignment = AlignmentScale(device)
         meta_rng = np.random.default_rng(args.seed + 6)
@@ -489,10 +494,12 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                 active = torch.cat((edit_rows, all_rows))
                 unit = alignment.normalize(torch.cat((h_edit, h_text)), contexts, active)
                 betas = torch.cat((signed_edit, signed_text)) / args.beta_max
-                controller_loss = -(unit * betas).sum() / active.sum()
-                signed_optimizer.zero_grad(set_to_none=True)
+                controller_loss = signed.hyper_loss(unit, betas * args.beta_max, contexts, active, args.beta_anchor)
+                for opt in signed_optimizers:
+                    opt.zero_grad(set_to_none=True)
                 controller_loss.backward()
-                signed_optimizer.step()
+                for opt in signed_optimizers:
+                    opt.step()
                 for c, name in enumerate(CONTEXTS):
                     rows = active & (contexts == c)
                     key = name.replace("/", "_")
@@ -582,6 +589,7 @@ def train(cfg: dict, device: torch.device, args) -> Path:
             beta_contexts=list(CONTEXTS), beta_initial=signed_initial, beta_final=signed.table(device),
             beta_max=args.beta_max, signed_span=args.signed_span, nce_scale=args.nce_scale,
             nce_tau_sq=nce_tau_sq.tolist(), fd_step=args.fd_step, controller_lr=args.controller_lr,
+            sign_lr=args.sign_lr, beta_anchor=args.beta_anchor,
             modulation_ramp_steps=ramp, finite_difference_scale=fd_scale,
         )
         matching_state["signed_beta"] = signed.state_dict()
@@ -635,7 +643,9 @@ def _options():
     parser.add_argument("--signed-span", type=float, default=0.4, help="signed_itm bound on the A modulation")
     parser.add_argument("--nce-scale", type=float, default=1.0, help="signed_itm InfoNCE nats per unit beta")
     parser.add_argument("--fd-step", type=float, default=1e-4, help="relative finite-difference step")
-    parser.add_argument("--controller-lr", type=float, default=2e-3, help="signed_itm beta MLP learning rate")
+    parser.add_argument("--controller-lr", type=float, default=1e-3, help="signed_itm A-modulation MLP learning rate")
+    parser.add_argument("--sign-lr", type=float, default=3e-4, help="signed_itm context MLP momentum-SGD learning rate")
+    parser.add_argument("--beta-anchor", type=float, default=0.25, help="signed_itm trust region on context logits")
     parser.add_argument("--itm-weight", type=float, default=0.02)
     parser.add_argument("--itm-label-fraction", type=float, default=1.0, help="fraction of scenes labeling the matching branch")
     parser.add_argument("--controller-weight", type=float, default=0.01)

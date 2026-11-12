@@ -79,3 +79,21 @@ def test_alignment_scale_normalizes_each_context_separately():
     context = torch.tensor([0, 0, 3, 3, -1])
     unit = scale.normalize(values, context, context >= 0)
     assert torch.allclose(unit[:4], torch.tensor([1.0, -1.0, 1.0, -1.0])) and unit[4] == 0
+
+
+def test_anchored_hyper_loss_settles_in_proportion_to_alignment():
+    _, _, controller = _controller()
+    optimizer = torch.optim.SGD(controller.sign.parameters(), lr=0.05, momentum=0.9)
+    context = torch.tensor([0, 1, 2, 3])
+    active = torch.ones(4, dtype=torch.bool)
+    alignment = torch.tensor([0.05, -0.05, 0.0, 0.2])
+    for _ in range(3000):
+        beta = controller.context_beta(context)
+        loss = controller.hyper_loss(alignment, beta, context, active, 0.25)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    u = controller.context_logits(context).detach()
+    expected = alignment * (1 - torch.tanh(u).square()) / 0.25
+    assert torch.allclose(u - controller.offset, expected, atol=2e-3)
+    assert controller.table(torch.device("cpu"))[1] < 0.0006 < controller.table(torch.device("cpu"))[0]

@@ -21,7 +21,8 @@ beta receives no gradient from the training loss. The MLP follows a one-step loo
 after theta' = theta - eta grad(D + sum_i beta_i S_i), dL_meta/dbeta_i ~= -eta <grad L_meta, grad S_i>,
 where L_meta is the task loss of an independent training batch and S_i the active branch surrogate.
 The inner product is the directional derivative of S_i along grad L_meta over the query-producing
-parameters, computed by a central finite difference in FP32.
+parameters, computed by a central finite difference in FP32. Each context contributes its own mean
+alignment; a quadratic anchor on the context logits and momentum SGD keep the step proportional to the signal.
 """
 from __future__ import annotations
 
@@ -84,9 +85,28 @@ class SignedBeta(nn.Module):
             nn.init.zeros_(head.bias)
         self.register_buffer("offset", torch.tensor([math.atanh(v / beta_max) for v in initial]))
 
+    def context_logits(self, context: torch.Tensor) -> torch.Tensor:
+        return self.sign(context_codes(context)).squeeze(1).float() + self.offset[context.clamp_min(0)]
+
     def context_beta(self, context: torch.Tensor) -> torch.Tensor:
-        u = self.sign(context_codes(context)).squeeze(1).float() + self.offset[context.clamp_min(0)]
-        return self.beta_max * torch.tanh(u)
+        return self.beta_max * torch.tanh(self.context_logits(context))
+
+    def anchor(self, device: torch.device) -> torch.Tensor:
+        """Squared distance of every context logit from its initial value."""
+        return (self.context_logits(torch.arange(len(CONTEXTS), device=device)) - self.offset).square().sum()
+
+    def hyper_loss(self, unit: torch.Tensor, beta: torch.Tensor, context: torch.Tensor, active: torch.Tensor,
+                   anchor: float) -> torch.Tensor:
+        """Per-context mean of -dL_meta/dbeta * beta, plus a quadratic trust region on the context logits.
+
+        Stationary points satisfy a_c (1 - tanh^2 u_c) = anchor (u_c - u0_c), so the logit shift is proportional
+        to the mean alignment a_c instead of saturating whenever a_c keeps one sign.
+        """
+        index = context.clamp_min(0)
+        weight = active.float()
+        terms = torch.zeros(len(CONTEXTS), device=beta.device).index_add(0, index, unit * beta / self.beta_max * weight)
+        counts = torch.zeros(len(CONTEXTS), device=beta.device).index_add(0, index, weight)
+        return -(terms / counts.clamp_min(1)).sum() + 0.5 * anchor * self.anchor(beta.device)
 
     def forward(
         self, features: torch.Tensor, instruction: torch.Tensor, context: torch.Tensor, active: torch.Tensor,
