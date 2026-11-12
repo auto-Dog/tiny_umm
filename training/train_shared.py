@@ -23,6 +23,7 @@ from models.understanding import ATTRIBUTES, class_counts
 from .common import arguments, batch_slices, mixed_indices, mixed_precision, setup
 from .train_flow import flow_batch
 from .query_objectives import MatchingPairs, QueryObjectives, masked_mean, validate_matching
+from .signed_beta import CONTEXTS, TEXT_CONTEXT, AlignmentScale, SignedBeta, directional_derivatives, grouped_nce
 
 
 def labels_at(labels: dict, idx: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -209,9 +210,49 @@ def validate(
     return {"scenes": n, **result}
 
 
+@torch.no_grad()
+def calibrate_nce_temperature(model: TinyUMM, data: dict, device: torch.device, amp, seed: int) -> torch.Tensor:
+    """Fix tau_c^2 to half the mean same-context squared query distance of the starting model."""
+    n = min(len(data["images"]), 512)
+    idx = np.sort(np.random.default_rng(seed + 77).choice(len(data["images"]), size=n, replace=False))
+    queries, contexts = [], []
+    for part in batch_slices(n, 128):
+        rows = idx[part]
+        source, _, prompt = flow_batch(data, rows, np.ones(len(rows), dtype=bool), device)
+        text_prompt = model.understand_tokens[None].expand(len(rows), -1)
+        with amp():
+            queries += [model.condition(prompt, source).visual.float().flatten(1),
+                        model.condition(text_prompt, source).visual.float().flatten(1)]
+        contexts += [torch.as_tensor(data["edit_types"][rows].astype(np.int64), device=device),
+                     torch.full((len(rows),), TEXT_CONTEXT, device=device)]
+    queries, contexts = torch.cat(queries), torch.cat(contexts)
+    tau_sq = []
+    for c in range(len(CONTEXTS)):
+        group = queries[contexts == c]
+        if len(group) < 2:
+            raise ValueError(f"NCE temperature calibration needs two {CONTEXTS[c]} examples")
+        distance = torch.cdist(group, group).square()
+        tau_sq.append(distance.sum() / (len(group) * (len(group) - 1)) / 2)
+    return torch.stack(tau_sq)
+
+
+def meta_task_loss(model: TinyUMM, data: dict, labels: dict, rng, generators, device, args, amp) -> torch.Tensor:
+    """Task loss on an independent training batch; uses its own RNG streams only."""
+    idx = rng.choice(len(data["images"]), size=args.batch_size)
+    is_edit = rng.random(args.batch_size) >= args.generation_ratio
+    source, target, prompt = flow_batch(data, idx, is_edit, device)
+    text_prompt = model.understand_tokens[None].expand(len(idx), -1)
+    with amp():
+        condition = sampled_condition(model, model.condition(prompt, source), generators[0], prompt)
+        fm_loss = flow_matching_errors(model.flow, target, condition, generators[1]).mean()
+        text_condition = sampled_condition(model, model.condition(text_prompt, source), generators[2], text_prompt)
+        ce = text_errors(model.read_text(text_condition), labels_at(labels, idx, device)).mean()
+    return fm_loss + args.text_weight * ce
+
+
 def configure_objective(args) -> None:
     """Keep legacy defaults and give the paired ablations the same low-noise channel."""
-    uses_ib = args.objective in ("ib", "ib_itm", "dynamic_itm")
+    uses_ib = args.objective in ("ib", "ib_itm", "dynamic_itm", "signed_itm")
     if args.edit_beta is None:
         args.edit_beta = 0.0006 if uses_ib else 0.0
     if args.posterior_std is None:
@@ -228,6 +269,12 @@ def configure_objective(args) -> None:
         raise ValueError("ITM label fraction must be in (0, 1]")
     if not 0 <= args.beta_span < 1 or not 0 < args.probe_erase < 1:
         raise ValueError("beta span must be in [0, 1) and probe erasure probability in (0, 1)")
+    if args.objective == "signed_itm" and not (
+        0 < args.edit_beta < args.beta_max and abs(args.text_beta) < args.beta_max and 0 <= args.signed_span < 0.5
+        and args.nce_scale > 0 and 0 < args.fd_step < 1e-2 and args.controller_lr > 0
+    ):
+        raise ValueError("signed_itm needs 0 < edit beta < beta max, |text beta| < beta max, span in [0, 0.5), "
+                         "positive NCE scale and controller lr, and a small finite-difference step")
     if any(not math.isfinite(value) or value <= 0 for value in (
         args.itm_weight, args.controller_weight, args.controller_temperature,
     )):
@@ -245,7 +292,7 @@ def train(cfg: dict, device: torch.device, args) -> Path:
         raise ValueError("seed and posterior std must be nonnegative")
     if not math.isfinite(args.edit_beta):
         raise ValueError("edit KL weight must be finite")
-    if not math.isfinite(args.text_beta) or args.text_beta < 0:
+    if not math.isfinite(args.text_beta) or (args.text_beta < 0 and args.objective != "signed_itm"):
         raise ValueError("text KL weight must be finite and nonnegative")
     if not math.isfinite(args.foreground_weight) or args.foreground_weight < 0:
         raise ValueError("foreground weight must be finite and nonnegative")
@@ -287,6 +334,20 @@ def train(cfg: dict, device: torch.device, args) -> Path:
             if auxiliary.controller is not None and "controller" in saved["matching_state"]:
                 auxiliary.controller.load_state_dict(saved["matching_state"]["controller"])
         pairs = MatchingPairs(train_data, args.seed + 4, args.itm_label_fraction)
+    signed = None
+    if args.objective == "signed_itm":
+        with torch.random.fork_rng(devices=[]):
+            # Leave the global RNG untouched so data and noise streams stay paired with the other objectives.
+            torch.manual_seed(args.seed + 8)
+            signed = SignedBeta(cfg, args.beta_max, (args.edit_beta,) * 3 + (args.text_beta,), args.signed_span)
+        signed.to(device)
+        signed_optimizer = torch.optim.AdamW(signed.parameters(), lr=args.controller_lr,
+                                             weight_decay=cfg["training"]["weight_decay"])
+        nce_tau_sq = calibrate_nce_temperature(model, train_data, device, amp, args.seed)
+        alignment = AlignmentScale(device)
+        meta_rng = np.random.default_rng(args.seed + 6)
+        meta_generators = [torch.Generator(device=device).manual_seed(args.seed + 6 + i) for i in range(1, 4)]
+        signed_initial = signed.table(device)
     teacher_path = checkpoint_path(cfg, "flow") if args.spatial_teacher else None
     teacher = None
     if teacher_path is not None:
@@ -298,6 +359,8 @@ def train(cfg: dict, device: torch.device, args) -> Path:
     if auxiliary is not None:
         groups += auxiliary.optimizer_groups(args.lr)
     params = [p for group in groups for p in group["params"]]
+    upstream = [p for group in groups if group["name"] in ("theta_image", "theta_instruction", "phi_queries")
+                for p in group["params"]]
     start_weights = [p.detach().clone() for p in params]
     optimizer = torch.optim.AdamW(groups, weight_decay=cfg["training"]["weight_decay"], fused=device.type == "cuda")
     grad_clip = cfg["training"]["grad_clip"]
@@ -362,8 +425,33 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                     edit_rates = prior.edit_rate(diagnostic, mean.visual, edit_reference, args.prior_std) * edit_rows
                     text_rates = diagnostic.rate(text_mean.visual, prior.text(gold), args.prior_std)
                     edit_rate, text_rate = edit_rates.mean(), text_rates.mean()
-                    rate_loss = args.edit_beta * (edit_rates * edit_multiplier).mean()
-                    rate_loss += args.text_beta * (text_rates * text_multiplier).mean()
+                    if signed is None:
+                        rate_loss = args.edit_beta * (edit_rates * edit_multiplier).mean()
+                        rate_loss += args.text_beta * (text_rates * text_multiplier).mean()
+                    else:
+                        edit_types = torch.as_tensor(train_data["edit_types"][idx].astype(np.int64), device=device)
+                        edit_context = torch.where(edit_rows, edit_types, -1)
+                        text_context = torch.full_like(edit_context, TEXT_CONTEXT)
+                        all_rows = torch.ones_like(edit_rows)
+                        edit_noise = (condition.visual.float() - mean.visual.float()).detach()
+                        edit_nce, _ = grouped_nce(condition.visual, mean.visual, edit_context, nce_tau_sq)
+                        text_nce, _ = grouped_nce(text_condition.visual, text_mean.visual, text_context, nce_tau_sq)
+                        span_scale = min(1.0, max(0.0, (step + 1 - ramp) / ramp))
+                        with torch.no_grad():
+                            edit_features = model.query_features(condition)
+                        signed_edit = signed(edit_features, mean.instruction, edit_context, edit_rows, span_scale)
+                        signed_text = signed(text_features, text_mean.instruction, text_context, all_rows, span_scale)
+                        be, bt = signed_edit.detach(), signed_text.detach()
+                        # Positive weights use the KL upper bound, negative weights the InfoNCE lower bound.
+                        edit_penalty = torch.where(be >= 0, be * edit_rates, args.nce_scale * be * edit_nce)
+                        text_penalty = torch.where(bt >= 0, bt * text_rates, args.nce_scale * bt * text_nce)
+                        rate_loss = edit_penalty.mean() + text_penalty.mean()
+                        matching_metrics.update(
+                            edit_nce=masked_mean(edit_nce, edit_rows), text_nce=text_nce.mean(),
+                            edit_beta_mean=masked_mean(be, edit_rows),
+                            edit_beta_std=masked_mean((be - masked_mean(be, edit_rows)).square(), edit_rows).sqrt(),
+                            text_beta_mean=bt.mean(),
+                        )
                 if auxiliary is not None:
                     beta = args.edit_beta * edit_multiplier
                     beta_mean = masked_mean(beta, edit_rows)
@@ -375,6 +463,44 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                 loss = fm_loss + args.text_weight * ce + rate_scale * rate_loss + extra_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if signed is not None:
+                # One-step lookahead: d L_meta / d beta_i ~ -eta <grad L_meta, grad S_i>, S_i the active bound.
+                meta = meta_task_loss(model, train_data, labels, meta_rng, meta_generators, device, args, amp)
+                direction = [g if g is not None else torch.zeros_like(p) for p, g in zip(
+                    upstream, torch.autograd.grad(meta, upstream, allow_unused=True))]
+                text_noise = (text_condition.visual.float() - text_mean.visual.float()).detach()
+
+                def surrogates():
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        edit_q = model.condition(prompt, source).visual.float()
+                        text_q = model.condition(text_prompt, source).visual.float()
+                        return (
+                            prior.edit_rate(diagnostic, edit_q, edit_reference, args.prior_std) * edit_rows,
+                            diagnostic.rate(text_q, prior.text(gold), args.prior_std),
+                            grouped_nce(edit_q + edit_noise, edit_q, edit_context, nce_tau_sq)[0],
+                            grouped_nce(text_q + text_noise, text_q, text_context, nce_tau_sq)[0],
+                        )
+
+                (d_edit_kl, d_text_kl, d_edit_nce, d_text_nce), fd_scale = directional_derivatives(
+                    upstream, direction, args.fd_step, surrogates)
+                h_edit = torch.where(be >= 0, d_edit_kl, args.nce_scale * d_edit_nce)
+                h_text = torch.where(bt >= 0, d_text_kl, args.nce_scale * d_text_nce)
+                contexts = torch.cat((edit_context, text_context))
+                active = torch.cat((edit_rows, all_rows))
+                unit = alignment.normalize(torch.cat((h_edit, h_text)), contexts, active)
+                betas = torch.cat((signed_edit, signed_text)) / args.beta_max
+                controller_loss = -(unit * betas).sum() / active.sum()
+                signed_optimizer.zero_grad(set_to_none=True)
+                controller_loss.backward()
+                signed_optimizer.step()
+                for c, name in enumerate(CONTEXTS):
+                    rows = active & (contexts == c)
+                    key = name.replace("/", "_")
+                    matching_metrics[f"align_{key}"] = masked_mean(unit, rows)
+                    matching_metrics[f"align_kl_{key}"] = masked_mean(torch.cat((d_edit_kl, d_text_kl)), rows)
+                    matching_metrics[f"align_nce_{key}"] = masked_mean(torch.cat((d_edit_nce, d_text_nce)), rows)
+                    matching_metrics[f"beta_{key}"] = masked_mean(betas.detach() * args.beta_max, rows)
+                matching_metrics["meta_loss"] = meta.detach()
             if step == 0:
                 first_gradient_l2 = {
                     group["name"]: sum(
@@ -403,7 +529,10 @@ def train(cfg: dict, device: torch.device, args) -> Path:
                 matching_log = {name: (value / (step - last_log)).item() for name, value in matching_totals.items()}
                 history.append({"step": step, **dict(zip(names, values[:5])), "edit_query_rms": query_rms, **matching_log})
                 suffix = (f" ITM={matching_log['itm_loss']:.4f} beta_std={matching_log['edit_beta_std']:.6f}"
-                          if matching_log else "")
+                          if "itm_loss" in matching_log else "")
+                if signed is not None:
+                    suffix = " beta=" + ",".join(f"{v:+.6f}" for v in signed.table(device)) + (
+                        f" NCE=({matching_log['edit_nce']:.3f},{matching_log['text_nce']:.3f})")
                 print(f"[shared {step}/{args.steps}] FM={values[0]:.5f} CE={values[1]:.5f} "
                       f"edit_KL={values[2]:.4f} text_KL={values[3]:.4f} edit_query_rms={query_rms:.4f}{suffix}", flush=True)
                 totals.zero_()
@@ -448,6 +577,14 @@ def train(cfg: dict, device: torch.device, args) -> Path:
         "text_latent_rng_sha256": sha256(text_latent.get_state().cpu().numpy().tobytes()).hexdigest(),
     }
     matching_state = {}
+    if signed is not None:
+        settings.update(
+            beta_contexts=list(CONTEXTS), beta_initial=signed_initial, beta_final=signed.table(device),
+            beta_max=args.beta_max, signed_span=args.signed_span, nce_scale=args.nce_scale,
+            nce_tau_sq=nce_tau_sq.tolist(), fd_step=args.fd_step, controller_lr=args.controller_lr,
+            modulation_ramp_steps=ramp, finite_difference_scale=fd_scale,
+        )
+        matching_state["signed_beta"] = signed.state_dict()
     if auxiliary is not None:
         settings.update(
             itm_weight=args.itm_weight, itm_label_fraction=args.itm_label_fraction,
@@ -493,7 +630,12 @@ def _options():
     parser.add_argument("--device")
     parser.add_argument("--val-samples", type=positive_int, default=512)
     parser.add_argument("--log-every", type=positive_int, default=100)
-    parser.add_argument("--objective", choices=("baseline", "ib", "itm", "ib_itm", "dynamic_itm"))
+    parser.add_argument("--objective", choices=("baseline", "ib", "itm", "ib_itm", "dynamic_itm", "signed_itm"))
+    parser.add_argument("--beta-max", type=float, default=0.002, help="signed_itm bound on |beta(A, C)|")
+    parser.add_argument("--signed-span", type=float, default=0.4, help="signed_itm bound on the A modulation")
+    parser.add_argument("--nce-scale", type=float, default=1.0, help="signed_itm InfoNCE nats per unit beta")
+    parser.add_argument("--fd-step", type=float, default=1e-4, help="relative finite-difference step")
+    parser.add_argument("--controller-lr", type=float, default=2e-3, help="signed_itm beta MLP learning rate")
     parser.add_argument("--itm-weight", type=float, default=0.02)
     parser.add_argument("--itm-label-fraction", type=float, default=1.0, help="fraction of scenes labeling the matching branch")
     parser.add_argument("--controller-weight", type=float, default=0.01)
